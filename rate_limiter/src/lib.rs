@@ -242,6 +242,40 @@ impl TokenBucket {
     pub fn budget(&self) -> u64 {
         self.budget
     }
+
+    /// Updates the bucket configuration while preserving the current budget.
+    ///
+    /// The budget is capped at the new `size` to avoid a situation where
+    /// the remaining budget exceeds the new capacity.  Every other field
+    /// (`one_time_burst`, refill-time and the derived helpers) is
+    /// recomputed from the supplied parameters.
+    ///
+    /// Returns `None` (and leaves `self` unchanged) when `size` or
+    /// `complete_refill_time_ms` are zero — the caller should interpret
+    /// that as "disable this bucket".
+    pub fn update(
+        &mut self,
+        size: u64,
+        one_time_burst: u64,
+        complete_refill_time_ms: u64,
+    ) -> Option<()> {
+        if size == 0 || complete_refill_time_ms == 0 {
+            return None;
+        }
+
+        let complete_refill_time_ns = complete_refill_time_ms * NANOSEC_IN_ONE_MILLISEC;
+        let common_factor = gcd(size, complete_refill_time_ns);
+
+        self.size = size;
+        self.one_time_burst = one_time_burst;
+        self.refill_time = complete_refill_time_ms;
+        // Cap the current budget to the new size so we never exceed capacity.
+        self.budget = std::cmp::min(self.budget, size);
+        self.processed_capacity = size / common_factor;
+        self.processed_refill_time = complete_refill_time_ns / common_factor;
+
+        Some(())
+    }
 }
 
 /// Enum that describes the type of token used.
@@ -483,17 +517,41 @@ impl RateLimiter {
     }
 
     /// Updates the parameters of the token buckets associated with this RateLimiter.
-    // TODO: Please note that, right now, the buckets become full after being updated.
+    ///
+    /// When a bucket already exists and is being updated, the current budget is
+    /// preserved (capped to the new capacity) so that reconfiguration does not
+    /// cause an unintended burst of traffic.  When a bucket is newly created
+    /// (i.e. was previously disabled), it starts at full capacity.
     pub fn update_buckets(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
         let guard = self.inner.get_mut().unwrap();
         match bytes {
             BucketUpdate::Disabled => guard.bandwidth = None,
-            BucketUpdate::Update(tb) => guard.bandwidth = Some(tb),
+            BucketUpdate::Update(tb) => match guard.bandwidth.as_mut() {
+                Some(existing) => {
+                    if existing
+                        .update(tb.capacity(), tb.one_time_burst(), tb.refill_time_ms())
+                        .is_none()
+                    {
+                        guard.bandwidth = None;
+                    }
+                }
+                None => guard.bandwidth = Some(tb),
+            },
             BucketUpdate::None => (),
         }
         match ops {
             BucketUpdate::Disabled => guard.ops = None,
-            BucketUpdate::Update(tb) => guard.ops = Some(tb),
+            BucketUpdate::Update(tb) => match guard.ops.as_mut() {
+                Some(existing) => {
+                    if existing
+                        .update(tb.capacity(), tb.one_time_burst(), tb.refill_time_ms())
+                        .is_none()
+                    {
+                        guard.ops = None;
+                    }
+                }
+                None => guard.ops = Some(tb),
+            },
             BucketUpdate::None => (),
         }
     }
@@ -884,6 +942,7 @@ pub(crate) mod unit_tests {
         assert_eq!(x.bandwidth(), initial_bw);
         assert_eq!(x.ops(), initial_ops);
 
+        // Update with new parameters — budget should be preserved (capped to new size).
         let new_bw = TokenBucket::new(123, 0, 57).unwrap();
         let new_ops = TokenBucket::new(321, 12346, 89).unwrap();
         x.update_buckets(
@@ -891,21 +950,121 @@ pub(crate) mod unit_tests {
             BucketUpdate::Update(new_ops.clone()),
         );
 
-        {
-            let mut guard = x.inner.lock().unwrap();
-            // We have manually adjust the last_update field, because it changes when update_buckets()
-            // constructs new buckets (and thus gets a different value for last_update). We do this so
-            // it makes sense to test the following assertions.
-            guard.bandwidth.as_mut().unwrap().last_update = new_bw.last_update;
-            guard.ops.as_mut().unwrap().last_update = new_ops.last_update;
-        }
+        // The configuration parameters should be updated.
+        let bw = x.bandwidth().unwrap();
+        assert_eq!(bw.capacity(), 123);
+        assert_eq!(bw.one_time_burst(), 0);
+        assert_eq!(bw.refill_time_ms(), 57);
+        // Budget is preserved from old bucket (was 1000), capped to new size (123).
+        assert_eq!(bw.budget(), 123);
 
-        assert_eq!(x.bandwidth(), Some(new_bw));
-        assert_eq!(x.ops(), Some(new_ops));
+        let ops = x.ops().unwrap();
+        assert_eq!(ops.capacity(), 321);
+        assert_eq!(ops.one_time_burst(), 12346);
+        assert_eq!(ops.refill_time_ms(), 89);
+        // Budget is preserved from old bucket (was 10), capped to new size (321).
+        assert_eq!(ops.budget(), 10);
 
         x.update_buckets(BucketUpdate::Disabled, BucketUpdate::Disabled);
         assert_eq!(x.bandwidth(), None);
         assert_eq!(x.ops(), None);
+    }
+
+    #[test]
+    fn test_update_buckets_preserves_budget() {
+        // Create rate limiter with 1000 bytes/s, 1000 ops/s.
+        let mut rl = RateLimiter::new(1000, 0, 1000, 1000, 0, 1000).unwrap();
+
+        // Consume 900 bytes and 800 ops (leaving 100 and 200 respectively).
+        assert!(rl.consume(900, TokenType::Bytes));
+        assert!(rl.consume(800, TokenType::Ops));
+        assert_eq!(rl.bandwidth().unwrap().budget(), 100);
+        assert_eq!(rl.ops().unwrap().budget(), 200);
+
+        // Update with same capacity but different refill time — budget must be preserved.
+        let new_bw = TokenBucket::new(1000, 0, 500).unwrap();
+        let new_ops = TokenBucket::new(1000, 0, 500).unwrap();
+        rl.update_buckets(BucketUpdate::Update(new_bw), BucketUpdate::Update(new_ops));
+
+        assert_eq!(rl.bandwidth().unwrap().budget(), 100);
+        assert_eq!(rl.ops().unwrap().budget(), 200);
+        assert_eq!(rl.bandwidth().unwrap().refill_time_ms(), 500);
+        assert_eq!(rl.ops().unwrap().refill_time_ms(), 500);
+    }
+
+    #[test]
+    fn test_update_buckets_caps_budget_to_new_size() {
+        let mut rl = RateLimiter::new(1000, 0, 1000, 1000, 0, 1000).unwrap();
+
+        // Consume only 100 (leaving 900).
+        assert!(rl.consume(100, TokenType::Bytes));
+        assert_eq!(rl.bandwidth().unwrap().budget(), 900);
+
+        // Shrink capacity to 500 — budget should be capped to 500.
+        let new_bw = TokenBucket::new(500, 0, 1000).unwrap();
+        rl.update_buckets(BucketUpdate::Update(new_bw), BucketUpdate::None);
+
+        assert_eq!(rl.bandwidth().unwrap().budget(), 500);
+        assert_eq!(rl.bandwidth().unwrap().capacity(), 500);
+    }
+
+    #[test]
+    fn test_update_buckets_disabled_to_enabled_starts_full() {
+        // Start with both buckets disabled.
+        let mut rl = RateLimiter::new(0, 0, 0, 0, 0, 0).unwrap();
+        assert!(rl.bandwidth().is_none());
+        assert!(rl.ops().is_none());
+
+        // Enable bandwidth bucket — should start at full capacity.
+        let new_bw = TokenBucket::new(1000, 0, 1000).unwrap();
+        rl.update_buckets(BucketUpdate::Update(new_bw), BucketUpdate::None);
+
+        assert_eq!(rl.bandwidth().unwrap().budget(), 1000);
+        assert_eq!(rl.bandwidth().unwrap().capacity(), 1000);
+    }
+
+    #[test]
+    fn test_update_buckets_with_zero_disables() {
+        // Start with an active bucket.
+        let mut rl = RateLimiter::new(1000, 0, 1000, 0, 0, 0).unwrap();
+        assert!(rl.bandwidth().is_some());
+
+        // We can't construct a TokenBucket with size 0 (returns None),
+        // so use Disabled to test disabling an active bucket.
+        rl.update_buckets(BucketUpdate::Disabled, BucketUpdate::None);
+        assert!(rl.bandwidth().is_none());
+    }
+
+    #[test]
+    fn test_token_bucket_update() {
+        let mut tb = TokenBucket::new(1000, 0, 1000).unwrap();
+        assert_eq!(tb.budget(), 1000);
+
+        // Consume some tokens.
+        assert_eq!(tb.reduce(700), BucketReduction::Success);
+        assert_eq!(tb.budget(), 300);
+
+        // Update capacity to 2000 — budget should stay at 300.
+        assert!(tb.update(2000, 0, 500).is_some());
+        assert_eq!(tb.capacity(), 2000);
+        assert_eq!(tb.budget(), 300);
+        assert_eq!(tb.refill_time_ms(), 500);
+
+        // Update capacity to 100 — budget should be capped to 100.
+        assert!(tb.update(100, 50, 200).is_some());
+        assert_eq!(tb.capacity(), 100);
+        assert_eq!(tb.budget(), 100);
+        assert_eq!(tb.one_time_burst(), 50);
+        assert_eq!(tb.refill_time_ms(), 200);
+
+        // Update with zero size should fail and leave bucket unchanged.
+        assert!(tb.update(0, 0, 200).is_none());
+        assert_eq!(tb.capacity(), 100);
+        assert_eq!(tb.budget(), 100);
+
+        // Update with zero refill time should fail and leave bucket unchanged.
+        assert!(tb.update(500, 0, 0).is_none());
+        assert_eq!(tb.capacity(), 100);
     }
 
     #[test]
